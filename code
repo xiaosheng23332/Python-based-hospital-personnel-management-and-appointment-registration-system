@@ -1,0 +1,1429 @@
+import pymysql
+import tkinter as tk
+from tkinter import ttk
+import tkinter.messagebox
+import webbrowser
+import qrcode
+from pyzbar.pyzbar import decode
+from PIL import Image, ImageTk
+import time
+from tkinter import Tk, Label, PhotoImage, Button
+
+# 将bg_photo定义为全局变量
+global bg_photo
+
+# 在所有函数之外定义 tree 为全局变量
+tree = None
+# 在所有函数之外定义 user_info 为全局变量
+user_info = {"编号": None, "姓名": None, "性别": None}
+#定义time_label为全局变量
+time_label = None
+
+def create_medical_bill(email,user_type):
+    # Create a new window
+    bill_window = tk.Toplevel(window)
+    # Get the sender's name from the email
+    sender_name = email[1]
+
+    # Add labels and entries for the patient's info
+    patient_info_label = tk.Label(bill_window, text=f"患者信息：{sender_name}")
+    patient_info_label.grid(row=0, column=0, columnspan=2)
+
+    # Add a text widget for the doctor's initial diagnosis
+    diagnosis_label = tk.Label(bill_window, text="医生初检状况：")
+    diagnosis_label.grid(row=1, column=0, columnspan=2)
+    diagnosis_text = tk.Text(bill_window)
+    diagnosis_text.grid(row=2, column=0, columnspan=2)
+
+    # Connect to the database
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    # Get the test items and drugs from the database
+    cursor.execute("SELECT * FROM testitems")
+    test_items = cursor.fetchall()
+    cursor.execute("SELECT * FROM drugs")
+    drugs = cursor.fetchall()
+    # Get the patient's information
+    cursor.execute("SELECT 编号, 姓名, 性别, 年龄, 联系方式, 健康信息, 地址 FROM patient WHERE `姓名` = %s", (sender_name,))
+    patient_info = cursor.fetchone()
+    # Close the database connection
+    conn.close()
+    # Add a listbox for the test items
+    test_items_label = tk.Label(bill_window, text="建议检验项目：")
+    test_items_label.grid(row=3, column=0)
+    test_items_listbox = tk.Listbox(bill_window, selectmode=tk.SINGLE)
+    for item in test_items:
+        test_items_listbox.insert(tk.END, item)
+    test_items_listbox.grid(row=4, column=0)
+
+    # Add a listbox for the drugs and a Spinbox for the quantity
+    drugs_label = tk.Label(bill_window, text="药物开具：")
+    drugs_label.grid(row=3, column=1)
+    # Add a label for the drug quantity
+    drugs_quantity_label = tk.Label(bill_window, text="药物数量")
+    drugs_quantity_label.grid(row=3, column=2)
+    drugs_listbox = tk.Listbox(bill_window, selectmode=tk.SINGLE)
+    drugs_spinbox = tk.Spinbox(bill_window, from_=1, to=100)  # Let the user select a quantity from 1 to 100
+    for drug in drugs:
+        drugs_listbox.insert(tk.END, drug)
+    drugs_listbox.grid(row=4, column=1)
+    drugs_spinbox.grid(row=4, column=2)  # Place the Spinbox next to the Listbox
+
+    # Add a label for the total price
+    total_price_label = tk.Label(bill_window, text="价格总和：0")
+    total_price_label.grid(row=5, column=0, columnspan=2)
+
+    # Function to update the total price label and diagnosis text
+    def update_total_price(event):
+        # Get the listbox that the event happened in
+        listbox = event.widget
+
+        # Check if there is a selected item
+        if len(listbox.curselection()) == 0:
+            return
+
+        # Get the selected item
+        selected_item = listbox.get(listbox.curselection()[0])
+
+        # Update the total price
+        total_price = int(total_price_label.cget("text").split("：")[1])
+        if listbox == test_items_listbox:
+            total_price += selected_item[1]
+            # Add the selected item to the diagnosis text
+            diagnosis_text.insert(tk.END, f"{selected_item}\n")
+        else:  # listbox == drugs_listbox
+            quantity = int(drugs_spinbox.get())  # Get the selected quantity
+            total_price += selected_item[4] * quantity  # Multiply the price by the quantity
+            # Add the selected item and quantity to the diagnosis text
+            diagnosis_text.insert(tk.END, f"{selected_item} * {quantity}\n")
+        total_price_label.config(text=f"价格总和：{total_price}")
+    # Bind the update function to selection events
+    test_items_listbox.bind('<<ListboxSelect>>', update_total_price)
+    drugs_listbox.bind('<<ListboxSelect>>', update_total_price)
+
+    def send_bill():
+        # Get the diagnosis text
+        diagnosis = diagnosis_text.get('1.0', 'end')
+
+        # Get the total price
+        total_price = total_price_label.cget("text").split("：")[1]
+
+        # Create the patient info content
+        patient_content = f"患者信息：\n\n编号：{patient_info[0]}\n姓名：{patient_info[1]}\n性别：{patient_info[2]}\n年龄：{patient_info[3]}\n联系方式：{patient_info[4]}\n健康信息：{patient_info[5]}\n地址：{patient_info[6]}"
+
+        # Create the bill content
+        content = f"{patient_content}\n医生初检情况：{diagnosis}\n价格总和：{total_price}"
+
+
+        # Send the bill
+        send_email(user_info['姓名'], sender_name, "医疗清单", content,'doctor')
+
+
+        # Return to the email view
+        view_emails('doctor')  # replace 'doctor' with the appropriate user type
+
+    send_button = tk.Button(bill_window, text="发送", command=send_bill,font=("宋体", 17))
+    send_button.grid(row=6, column=0, columnspan=2)
+def send_email(sender, receiver, subject, content,user_type):
+    # 获取当前时间
+    send_time = time.strftime('%Y-%m-%d %H:%M:%S')
+
+    # 连接到数据库
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    # 查询当前的最大邮件ID
+    cursor.execute("SELECT MAX(邮件ID) FROM emails")
+    max_email_id = cursor.fetchone()[0]
+
+    # 如果数据库中没有邮件，那么最大邮件ID就是None，我们需要将它设置为0
+    if max_email_id is None:
+        max_email_id = 0
+
+    # 新的邮件ID是最大邮件ID加1
+    new_email_id = max_email_id + 1
+
+    # 向 email 表中插入一条新的邮件记录
+    cursor.execute("INSERT INTO emails (邮件ID, 发送者, 接收者, 邮件主题, 邮件内容, 发送时间) VALUES (%s, %s, %s, %s, %s, %s)",
+                   (new_email_id, sender, receiver, subject, content, send_time))
+
+    if user_type == 'doctor' and subject == "医疗清单":
+        cursor.execute("SELECT * FROM nurse WHERE `主管医生` = %s", (sender,))
+        nurses = cursor.fetchall()
+
+        # 向每个护士发送邮件
+        for nurse in nurses:
+            new_email_id += 1  # 新的邮件ID是最大邮件ID加1
+            cursor.execute("INSERT INTO emails (邮件ID, 发送者, 接收者, 邮件主题, 邮件内容, 发送时间) VALUES (%s, %s, %s, %s, %s, %s)",
+                            (new_email_id, sender, nurse[1], subject, content, send_time))
+
+    # 提交更改并关闭连接
+    conn.commit()
+    conn.close()
+    # 显示成功的提示
+    tkinter.messagebox.showinfo("信息", "邮件发送成功")
+
+def create_health_report():
+    # Create a new window
+    report_window = tk.Toplevel(window)
+
+    # Add labels and entries for the health metrics
+    attributes = ["用户ID", "姓名", "身高", "体重", "血压", "心率", "血糖", "血脂", "血尿酸"]
+    entries = {}
+    for attr in attributes:
+        label = tk.Label(report_window, text=attr, font=("宋体", 20))
+        label.pack()
+        entry = tk.Entry(report_window, font=("宋体", 20))
+        entry.pack()
+        entries[attr] = entry
+
+    # Add a button for confirming the creation
+    def confirm_creation():
+        # Get the entered data
+        data = [entry.get() for entry in entries.values()]
+
+        # Connect to the database
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # Insert the new health report into the healthmetrics table, or update the existing one if the user ID already exists
+        cursor.execute("""
+            INSERT INTO healthmetrics (用户ID, 姓名, 身高, 体重, 血压, 心率, 血糖, 血脂, 血尿酸) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+            姓名 = VALUES(姓名),
+            身高 = VALUES(身高),
+            体重 = VALUES(体重),
+            血压 = VALUES(血压),
+            心率 = VALUES(心率),
+            血糖 = VALUES(血糖),
+            血脂 = VALUES(血脂),
+            血尿酸 = VALUES(血尿酸)
+        """, data)
+
+        # Get the patient's name
+        patient_name = entries["姓名"].get()
+
+        # Create the email content
+        content = f"健康报告：\n\n姓名：{data[1]}\n身高：{data[2]}cm\n体重：{data[3]}kg\n血压：{data[4]}mmHg\n心率：{data[5]}bpm\n血糖：{data[6]}mmol/L\n血脂：{data[7]}mmol/L\n血尿酸：{data[8]}μmol/L"
+
+        # Send the email
+        send_email(user_info['姓名'], patient_name, "健康报告", content, 'nurse')
+
+        # Close the connection
+        conn.commit()
+        conn.close()
+
+        # Close the report window
+        report_window.destroy()
+
+    confirm_button = tk.Button(report_window, text="发送", command=confirm_creation,font=("宋体", 17))
+    confirm_button.pack()
+
+def view_emails(user_type):
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    # Map user types to interface functions
+    interface_functions = {
+            'nurse': nurse_interface,
+            'doctor': doctor_interface,
+            'patient': patient_interface,
+            'administrator': admin_interface
+        }
+
+    # Get the appropriate function
+    interface_function = interface_functions.get(user_type)
+
+    # Add a button for returning to the previous interface
+    return_button = tk.Button(window, text="返回", command=interface_function,font=("宋体", 17))
+    return_button.pack(anchor='nw', side='top')
+    # Connect to the database
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    if user_type == 'administrator':
+        # Get all emails from the database if user_type is 'administrator'
+        cursor.execute("SELECT 邮件ID,发送者, 接收者, 邮件主题, 邮件内容,发送时间 FROM emails")
+    else:
+        # Get the username from the corresponding table
+        cursor.execute(f"SELECT 姓名 FROM {user_type} WHERE `编号` = %s", (user_info["编号"],))
+        username = cursor.fetchone()[0]
+
+        # Execute a SQL query to select all emails sent to the user
+        cursor.execute("SELECT 邮件ID,发送者, 接收者, 邮件主题, 邮件内容,发送时间 FROM emails WHERE `接收者` = %s", (username,))
+
+    # Fetch the result of the query
+    rows = cursor.fetchall()
+
+    # Close the database connection
+    conn.close()
+    # Create a Treeview widget in the new window
+    tree = ttk.Treeview(window)
+
+    # Define the column names
+    columns = ( "邮件ID","发送者", "接收者", "邮件主题", "邮件内容", "发送时间")
+    tree["columns"] = columns
+
+    # Define the heading for each column
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=100)  # Set the width of each column to 100
+
+    # Show all columns
+    tree["show"] = "headings"
+
+    # Add the data to the Treeview widget
+    for row in rows:
+        tree.insert('', 'end', values=row)
+
+    # Pack the Treeview widget into the window
+    tree.pack()
+
+    # Add a button for creating a medical bill
+    def create_bill():
+        # Get the selected email
+        selected_item = tree.selection()
+        if not selected_item:
+            return
+        email = tree.item(selected_item[0])["values"]
+
+        # Call the create_medical_bill function with the selected email
+        create_medical_bill(email,user_type)
+    # Add a button for creating a health report
+    if user_type == 'nurse':
+        report_button = tk.Button(window, text="创建健康报告", command=create_health_report,font=("宋体", 17))
+        report_button.pack()
+    # Function to view the selected email
+    def view_selected_email():
+        # Get the selected item
+        selected_item = tree.selection()
+
+        # If no item is selected, return
+        if not selected_item:
+            return
+
+        # Get the email ID of the selected item
+        email_id = tree.item(selected_item[0])["values"][0]
+
+        # Get the email from the database
+        conn = connect_db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM emails WHERE `邮件ID` = %s", (email_id,))
+        email = cursor.fetchone()
+        conn.close()
+
+        # Clear all widgets from the window
+        for widget in window.winfo_children():
+            widget.destroy()
+
+        # Display the email
+        email_label = tk.Label(window, text=f"邮件ID: {email[0]}\n发送者: {email[1]}\n接收者: {email[2]}\n邮件主题: {email[3]}\n邮件内容: {email[4]}\n发送时间: {email[5]}")
+        email_label.pack()
+
+        # Add a button for returning to the email list
+        return_button = tk.Button(window, text="返回", command=lambda: view_emails(user_type),font=("宋体", 17))
+        return_button.pack()
+
+    # Add a button for viewing the selected email
+    view_button = tk.Button(window, text="查看选中邮件", command=view_selected_email,font=("宋体", 17))
+    view_button.pack()
+    if user_type != 'administrator':
+        # Add a button for sending an error report
+        error_button = tk.Button(window, text="发送报错邮件", command=lambda: send_error_report(user_type),font=("宋体", 17))
+        error_button.pack()
+    # Add a button for sending a chat message
+    chat_button = tk.Button(window, text="发送聊天信息", command=lambda: send_chat_message(user_info['姓名'],  user_type),font=("宋体", 17))
+    chat_button.pack()
+    if user_type == 'doctor':
+        create_bill_button = tk.Button(window, text="创建医疗清单", command=create_bill,font=("宋体", 17))
+        create_bill_button.pack()
+
+def send_chat_message(sender, user_type):
+    # Create a new window
+    chat_window = tk.Toplevel(window)
+    chat_window.geometry('500x500')  # Set the window size to 500x500
+
+    # Add a label and entry for the receiver's name
+    receiver_label = tk.Label(chat_window, text="接收者姓名",font=("宋体", 17))
+    receiver_label.pack()
+    receiver_entry = tk.Entry(chat_window)
+    receiver_entry.pack()
+
+    # Add a label and entry for the email content
+    content_label = tk.Label(chat_window, text="邮件内容",font=("宋体", 17))
+    content_label.pack()
+    content_entry = tk.Text(chat_window, width=50, height=30)
+    content_entry.pack()
+
+    # Add a button for confirming the creation
+    def confirm_creation():
+        # Get the entered data
+        receiver = receiver_entry.get()
+        content = content_entry.get('1.0', 'end')  # Get the content from the Text widget
+
+        # Send the email
+        send_email(sender, receiver, '聊天信息', content, user_type)
+
+        # Close the chat window
+        chat_window.destroy()
+
+    confirm_button = tk.Button(chat_window, text="发送", command=confirm_creation,font=("宋体", 17))
+    confirm_button.pack()
+def send_error_report(user_type):
+    # Create a new window
+    report_window = tk.Toplevel(window)
+    report_window.geometry('300x300')
+    # Add a label and entry for the email content
+    content_label = tk.Label(report_window, text="邮件内容")
+    content_label.pack()
+    content_entry = tk.Text(report_window, width=50, height=18)  # Set the width to 50 and height to 18
+    content_entry.pack()
+
+    # Add a button for confirming the creation
+    def confirm_creation():
+        # Get the entered data
+        content = content_entry.get('1.0', 'end')
+
+        # Send the email
+        send_email(user_info['姓名'], '小晟', '系统报错', content, user_type)
+
+        # Close the report window
+        report_window.destroy()
+
+    confirm_button = tk.Button(report_window, text="发送", command=confirm_creation,font=("宋体", 17))
+    confirm_button.pack()
+
+def patient_register():
+    # Create a new window
+    register_window = tk.Toplevel(window)
+
+    # Add labels and entries for the patient's attributes
+    attributes = ["编号", "姓名", "性别", "年龄", "联系方式", "健康信息", "地址", "账号", "密码"]
+    entries = {}
+    for attr in attributes:
+        label = tk.Label(register_window, text=attr, font=("宋体", 17))
+        label.pack()
+        entry = tk.Entry(register_window, font=("宋体", 17))
+        entry.pack()
+        entries[attr] = entry
+
+    # Add a button for confirming the registration
+    def confirm_registration():
+        # Get the entered data
+        data = [entry.get() for entry in entries.values()]
+
+        # Connect to the database
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # Insert the new patient into the patient table
+        cursor.execute("INSERT INTO patient (编号, 姓名, 性别, 年龄, 联系方式, 健康信息, 地址, 账号, 密码) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)", data)
+        # Query the new patient's information
+        cursor.execute("SELECT 编号, 姓名, 性别 FROM patient WHERE `账号` = %s AND `密码` = %s", (data[7], data[8]))
+        new_patient_info = cursor.fetchone()
+
+        # Store the new patient's information in the global variable
+        global user_info
+        user_info["编号"] = new_patient_info[0]
+        user_info["姓名"] = new_patient_info[1]
+        user_info["性别"] = new_patient_info[2]
+        # Commit the changes and close the connection
+        conn.commit()
+        conn.close()
+
+        # Close the registration window
+        register_window.destroy()
+        tkinter.messagebox.showinfo("注册成功", "欢迎使用医院挂号医疗系统！")
+        # Load the patient interface
+        patient_interface()
+
+    confirm_button = tk.Button(register_window, text="确定", command=confirm_registration, font=("宋体", 20))
+    confirm_button.pack()
+# 创建一个函数，用于更新时间
+def update_time():
+    current_time = time.strftime('%Y-%m-%d %H:%M:%S')  # 获取当前时间
+    if time_label.winfo_exists():  # 检查time_label是否存在
+        time_label.config(text=current_time)  # 更新标签的文本
+    window.after(1000, update_time)  # 1秒后再次调用此函数
+def add_doctor():
+    # Create a new window
+    add_window = tk.Toplevel(window)
+
+    # Add labels and entries for the doctor's attributes
+    attributes = ["编号", "姓名", "性别", "年龄",  "联系方式", "所属科室", "账号", "密码"]
+    entries = {}
+    for attr in attributes:
+        label = tk.Label(add_window, text=attr)
+        label.pack()
+        entry = tk.Entry(add_window)
+        entry.pack()
+        entries[attr] = entry
+
+    # Add a button for confirming the addition
+    def confirm_addition():
+        # Connect to the database
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # Insert the new doctor into the doctor table
+        cursor.execute(f"INSERT INTO doctor ({', '.join(attributes)}) VALUES ({', '.join(['%s'] * len(attributes))})",
+                       [entry.get() for entry in entries.values()])
+
+        # Commit the changes and close the connection
+        conn.commit()
+        conn.close()
+
+        # Close the add window
+        add_window.destroy()
+
+        # Reload the doctor management interface to show the updated data
+        load_doctor_management_interface()
+
+    confirm_button = tk.Button(add_window, text="确定", command=confirm_addition,font=("宋体", 17))
+    confirm_button.pack()
+
+    # Add a button for cancelling the addition
+    cancel_button = tk.Button(add_window, text="取消", command=add_window.destroy,font=("宋体", 17))
+    cancel_button.pack()
+
+
+def connect_db():
+    conn = pymysql.connect(host='localhost', user='root', password='123456', db='hospital')  # 连接到数据库
+    return conn
+
+
+def add_department():
+    # Create a new window
+    add_window = tk.Toplevel(window)
+
+    # Add labels and entries for the department's attributes
+    attributes = ["医生姓名",  "科室编号", "科室姓名","科室描述","科室位置"]
+    entries = {}
+    for attr in attributes:
+        label = tk.Label(add_window, text=attr)
+        label.pack()
+        entry = tk.Entry(add_window)
+        entry.pack()
+        entries[attr] = entry
+
+    # Add a button for confirming the addition
+    def confirm_addition():
+        # Connect to the database
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # Insert the new department into the department table
+        cursor.execute(f"INSERT INTO department ({', '.join(attributes)}) VALUES ({', '.join(['%s'] * len(attributes))})",
+                       [entry.get() for entry in entries.values()])
+
+        # Commit the changes and close the connection
+        conn.commit()
+        conn.close()
+
+        # Close the add window
+        add_window.destroy()
+
+        # Reload the department management interface to show the updated data
+        load_department_management_interface_admin()
+
+    confirm_button = tk.Button(add_window, text="确定", command=confirm_addition,font=("宋体", 17))
+    confirm_button.pack()
+
+    # Add a button for cancelling the addition
+    cancel_button = tk.Button(add_window, text="取消", command=add_window.destroy,font=("宋体", 17))
+    cancel_button.pack()
+
+def delete_department():
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+
+    # 获取选中的行
+    selected_item = tree.selection()
+
+    # 如果没有选中任何行，就直接返回
+    if not selected_item:
+        return
+
+    # 获取选中行的科室编号
+    department_id = tree.item(selected_item[0])["values"][1]
+
+    # 弹出一个确认对话框，询问用户是否确定要删除
+    if not tkinter.messagebox.askyesno("确认", "确定要删除这个科室吗？"):
+        return
+
+    # 连接到数据库
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    # 从 department 表中删除该科室
+    cursor.execute("DELETE FROM department WHERE `科室编号` = %s", (department_id,))
+
+    # 提交更改并关闭连接
+    conn.commit()
+    conn.close()
+
+    # 重新加载科室管理界面以显示更新后的数据
+    load_department_management_interface_admin()
+
+def edit_department():
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+
+    # 获取选中的行
+    selected_item = tree.selection()
+
+    # 如果没有选中任何行，就直接返回
+    if not selected_item:
+        return
+
+    # 获取选中行的科室编号
+    department_id = tree.item(selected_item[0])["values"][1]
+
+    # 连接到数据库
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    # 从 department 表中获取该科室的信息
+    cursor.execute("SELECT * FROM department WHERE `科室编号` = %s", (department_id,))
+    department_info = cursor.fetchone()
+
+    # 关闭连接
+    conn.close()
+
+    # 创建一个新窗口
+    edit_window = tk.Toplevel(window)
+
+    # 在新窗口中添加输入框，用于编辑科室的信息
+    entries = {}
+    for i, attr in enumerate(["医生姓名", "科室编号", "科室姓名", "科室描述", "科室位置"]):
+        label = tk.Label(edit_window, text=attr)
+        label.grid(row=i, column=0)
+        entry = tk.Entry(edit_window)
+        entry.insert(0, department_info[i])  # 将当前值设置为输入框的初始值
+        entry.grid(row=i, column=1)
+        entries[attr] = entry
+
+    # 添加一个 "确认" 按钮，用于提交更改
+    def confirm_edit():
+        # 连接到数据库
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # 更新 department 表中的数据
+        cursor.execute("UPDATE department SET `医生姓名` = %s, `科室编号` = %s, `科室姓名` = %s, `科室描述` = %s, `科室位置` = %s WHERE `科室编号` = %s",
+                       (entries["医生姓名"].get(), entries["科室编号"].get(), entries["科室姓名"].get(), entries["科室描述"].get(), entries["科室位置"].get(), department_id))
+
+        # 提交更改并关闭连接
+        conn.commit()
+        conn.close()
+
+        # 关闭编辑窗口
+        edit_window.destroy()
+
+        # 重新加载科室管理界面以显示更新后的数据
+        load_department_management_interface_admin()
+
+    confirm_button = tk.Button(edit_window, text="确认", command=confirm_edit)
+    confirm_button.grid(row=len(entries), column=0, columnspan=2)
+
+def load_department_management_interface_admin():
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+    return_button = tk.Button(window, text="返回", command=admin_interface,font=("宋体", 17))
+    return_button.pack(side='top', anchor='w')
+    # Connect to the database and get the data from the department table
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 医生姓名, 科室编号, 科室姓名,科室描述,科室位置 FROM department")
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Create a Treeview widget
+    tree = ttk.Treeview(window)
+
+    # Define the column names
+    columns = ("医生姓名", "科室编号", "科室姓名",  "科室描述","科室位置")
+    tree["columns"] = columns
+
+    # Define the heading for each column
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=100)  # Set the width of each column to 100
+
+    # Show all columns
+    tree["show"] = "headings"
+
+    # Add the data to the Treeview widget
+    for row in rows:
+        tree.insert('', 'end', values=row)
+
+    # Pack the Treeview widget into the window
+    tree.pack()
+
+    add_button = tk.Button(window, text="    增添    ", command=add_department,font=("宋体", 22))
+    add_button.pack(side='left', anchor='w')
+
+    # Add a button for deleting a department
+    delete_button = tk.Button(window, text="    删除    ", command=delete_department,font=("宋体", 22))
+    delete_button.pack(side='left', anchor='w')
+
+    # Add a button for editing a department
+    edit_button = tk.Button(window, text="    编辑    ", command=edit_department,font=("宋体", 22))
+    edit_button.pack(side='left', anchor='w')
+
+
+def load_doctor_management_interface():
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+    # Add a button for returning to the admin interface
+    return_button = tk.Button(window, text="返回", command=admin_interface,font=("宋体", 17))
+    return_button.pack(side='top', anchor='w')
+   # Connect to the database and get the data from the doctor table
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 编号, 姓名, 性别, 年龄,  联系方式, 所属科室 FROM doctor")
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Create a Treeview widget
+    tree = ttk.Treeview(window)
+
+    # Define the column names
+    columns = ("编号", "姓名", "性别", "年龄",  "联系方式", "所属科室")
+    tree["columns"] = columns
+
+    # Define the heading for each column
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=100)  # Set the width of each column to 100
+    # Show all columns
+    tree["show"] = "headings"
+
+    # Add the data to the Treeview widget
+    for row in rows:
+        tree.insert('', 'end', values=row)
+
+    # Pack the Treeview widget into the window
+    tree.pack()
+    # Add a button for adding a doctor
+    add_button = tk.Button(window, text="    增添    ", command=add_doctor, font=("宋体", 22))
+    add_button.pack(side='left', anchor='w')
+
+    # Add a button for deleting a doctor
+    delete_button = tk.Button(window, text="    删除    ", command=delete_doctor, font=("宋体", 22))
+    delete_button.pack(side='left', anchor='w')
+
+    # Add a button for editing a doctor
+    edit_button = tk.Button(window, text="    编辑    ", command=edit_doctor, font=("宋体", 22))
+    edit_button.pack(side='left', anchor='w')
+
+
+def delete_doctor():
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+
+    # 获取选中的行
+    selected_item = tree.selection()
+
+    # 如果没有选中任何行，就直接返回
+    if not selected_item:
+        return
+
+    # 获取选中行的医生编号
+    doctor_id = tree.item(selected_item[0])["values"][0]
+
+    # 弹出一个确认对话框，询问用户是否确定要删除
+    if not tkinter.messagebox.askyesno("确认", "确定要删除这个医生吗？"):
+        return
+
+    # 连接到数据库
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    # 从 doctor 表中删除该医生
+    cursor.execute("DELETE FROM doctor WHERE `编号` = %s", (doctor_id,))
+
+    # 提交更改并关闭连接
+    conn.commit()
+    conn.close()
+
+    # 重新加载医生管理界面以显示更新后的数据
+    load_doctor_management_interface()
+
+def edit_doctor():
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+
+    # 获取选中的行
+    selected_item = tree.selection()
+
+    # 如果没有选中任何行，就直接返回
+    if not selected_item:
+        return
+
+    # 获取选中行的医生编号
+    doctor_id = tree.item(selected_item[0])["values"][0]
+
+    # 连接到数据库
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    # 从 doctor 表中获取该医生的信息
+    cursor.execute("SELECT * FROM doctor WHERE `编号` = %s", (doctor_id,))
+    doctor_info = cursor.fetchone()
+
+    # 关闭连接
+    conn.close()
+
+    # 创建一个新窗口
+    edit_window = tk.Toplevel(window)
+
+    # 在新窗口中添加输入框，用于编辑医生的信息
+    entries = {}
+    for i, attr in enumerate(["编号", "姓名", "性别", "年龄", "联系方式", "所属科室", "账号", "密码"]):
+        label = tk.Label(edit_window, text=attr)
+        label.grid(row=i, column=0)
+        entry = tk.Entry(edit_window)
+        entry.insert(0, doctor_info[i])  # 将当前值设置为输入框的初始值
+        entry.grid(row=i, column=1)
+        entries[attr] = entry
+
+    # 添加一个 "确认" 按钮，用于提交更改
+    def confirm_edit():
+        # 连接到数据库
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # 更新 doctor 表中的数据
+        cursor.execute("UPDATE doctor SET `姓名` = %s, `性别` = %s, `年龄` = %s, `联系方式` = %s, `所属科室` = %s, `账号` = %s, `密码` = %s WHERE `编号` = %s",
+                       (entries["姓名"].get(), entries["性别"].get(), entries["年龄"].get(), entries["联系方式"].get(), entries["所属科室"].get(), entries["账号"].get(), entries["密码"].get(), doctor_id))
+
+        # 提交更改并关闭连接
+        conn.commit()
+        conn.close()
+
+        # 关闭编辑窗口
+        edit_window.destroy()
+
+        # 重新加载医生管理界面以显示更新后的数据
+        load_doctor_management_interface()
+
+    confirm_button = tk.Button(edit_window, text="确认", command=confirm_edit,font=("宋体", 17))
+    confirm_button.grid(row=len(entries), column=0, columnspan=2)
+
+
+def nurse_interface():
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    # Add a button for returning to the login interface
+    return_button = tk.Button(window, text="返回", command=lambda: load_login_interface('nurse'),font=("宋体", 17))
+    return_button.pack(anchor='nw', side='top')
+    # 创建一个标签，用于显示时间
+    global time_label  # 使用 global 关键字表示我们正在使用全局的 time_label 变量
+    time_label = tk.Label(window,font=("宋体", 17))
+    time_label.pack()
+    # 开始更新时间
+    update_time()
+    # Display the welcome message
+    welcome_label = tk.Label(window, text=f"你好，{user_info['姓名']}护士",font=("宋体", 17))
+    welcome_label.pack()
+    email_button = tk.Button(window, text="查看邮件", command=lambda: view_emails('nurse'),font=("宋体", 17))
+    email_button.pack()
+
+def doctor_interface():
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    # Add a button for returning to the login interface
+    return_button = tk.Button(window, text="返回", command=lambda: load_login_interface('doctor'),font=("宋体", 17))
+    return_button.pack(anchor='nw', side='top')
+    # 创建一个标签，用于显示时间
+    global time_label  # 使用 global 关键字表示我们正在使用全局的 time_label 变量
+    time_label = tk.Label(window,font=("宋体", 17))
+    time_label.pack()
+    # 开始更新时间
+    update_time()
+    # Display the welcome message
+    welcome_label = tk.Label(window, text=f"你好，{user_info['姓名']}医生",font=("宋体", 17))
+    welcome_label.pack()
+    email_button = tk.Button(window, text="查看邮件", command=lambda: view_emails('doctor'),font=("宋体", 17))
+    email_button.pack()
+
+
+def update_welcome_label():
+    # Determine the title based on the gender
+    title = "先生" if user_info["性别"] == "男" else "女士"
+    # Check if welcome_label still exists
+    if welcome_label.winfo_exists():
+        welcome_label.config(text=f"你好，{user_info['姓名']}{title}，现在是{time_label['text']}",font=("宋体", 14))
+    window.after(1000, update_welcome_label)  # 1秒后再次调用此函数
+
+def patient_interface():
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    # Add a button for returning to the login interface
+    return_button = tk.Button(window, text="返回", command=lambda: load_login_interface('patient'),font=("宋体", 14))
+    return_button.pack(anchor='nw', side='top')
+
+    # 创建一个标签，用于显示时间
+    global time_label  # 使用 global 关键字表示我们正在使用全局的 time_label 变量
+    time_label = tk.Label(window)
+
+    # 开始更新时间
+    update_time()
+
+    # Determine the title based on the gender
+    title = "先生" if user_info["性别"] == "男" else "女士"
+
+    # Display the welcome message
+    global welcome_label  # 使用 global 关键字表示我们正在使用全局的 welcome_label 变量
+    welcome_label = tk.Label(window, text=f"你好，{user_info['姓名']}{title}，现在是{time_label['text']}")
+    welcome_label.pack(side='top')
+
+    # 开始更新欢迎信息
+    update_welcome_label()
+
+    # Add a button for editing personal info
+    edit_button = tk.Button(window, text="编辑个人信息", command=edit_patient_info, font=("宋体", 14))
+    edit_button.pack()
+
+    # Add a button for making an appointment
+    appointment_button = tk.Button(window, text="预约挂号", command=load_department_management_interface_patient, font=("宋体", 14))
+    appointment_button.pack()
+
+    email_button = tk.Button(window, text="查看邮件", command=lambda: view_emails('patient'), font=("宋体", 14))
+    email_button.pack()
+
+def load_department_management_interface_patient():
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    # Add a button for returning to the previous interface
+    return_button = tk.Button(window, text="返回", command=patient_interface,font=("宋体", 17))
+    return_button.pack(anchor='nw', side='top')
+
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+
+    # Connect to the database and get the data from the department table
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 医生姓名, 科室编号, 科室姓名,科室描述,科室位置 FROM department")
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Create a Treeview widget
+    tree = ttk.Treeview(window)
+
+    # Define the column names
+    columns = ("医生姓名", "科室编号", "科室姓名", "科室描述", "科室位置")
+    tree["columns"] = columns
+
+    # Define the heading for each column
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=100)  # Set the width of each column to 100
+
+    # Show all columns
+    tree["show"] = "headings"
+
+    # Add the data to the Treeview widget
+    for row in rows:
+        tree.insert('', 'end', values=row)
+
+    # Pack the Treeview widget into the window
+    tree.pack()
+
+    # Add a button for making an appointment
+    def make_appointment():
+        # 获取选中的行
+        selected_item = tree.selection()
+
+        # 如果没有选中任何行，就直接返回
+        if not selected_item:
+            return
+
+        # 获取选中行的数据
+        selected_data = tree.item(selected_item[0])["values"]
+
+        # 获取科室对应的医生姓名
+        doctor_name = selected_data[0]
+
+        # 创建邮件内容
+        content = f"患者信息：{user_info}\n科室信息：{selected_data}"
+
+        # 发送邮件
+        send_email(user_info['姓名'], doctor_name, "你有一个新挂号", content,'patient')
+
+
+    appointment_button = tk.Button(window, text="预约", command=make_appointment,font=("宋体", 17))
+    appointment_button.pack()
+
+
+def edit_patient_info():
+
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    # Create a new frame in the main window
+    edit_frame = tk.Frame(window)
+
+    # Add an empty label at the top of the frame to create some space
+    empty_label = tk.Label(edit_frame, text="")
+    empty_label.grid(row=0, column=0)
+
+    # Add labels and entries for the patient's attributes
+    attributes = ["编号", "姓名", "性别", "年龄", "联系方式", "健康信息", "地址", "账号", "密码"]
+    entries = {}
+    for i, attr in enumerate(attributes):
+        label = tk.Label(edit_frame, text=attr, font=("宋体", 14))
+        label.grid(row=i+1, column=0)  # Note the row index is now i+1
+        entry = tk.Entry(edit_frame, font=("宋体", 14))
+        entry.grid(row=i+1, column=1)  # Note the row index is now i+1
+        entries[attr] = entry
+
+    # Load the current info into the entries
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 编号, 姓名, 性别, 年龄, 联系方式, 健康信息, 地址, 账号, 密码 FROM patient WHERE `编号` = %s", (user_info["编号"],))
+    row = cursor.fetchone()
+    conn.close()
+    for attr, value in zip(attributes, row):
+        entries[attr].insert(0, value)
+
+    # Add a button for confirming the edit
+    def confirm_edit():
+        # Connect to the database
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # Update the patient info in the patient table
+        cursor.execute(f"UPDATE patient SET 编号 = %s, 姓名 = %s, 性别 = %s, 年龄 = %s, 联系方式 = %s, 健康信息 = %s, 地址 = %s, 账号 = %s, 密码 = %s WHERE `编号` = %s",
+                       [entry.get() for entry in entries.values()] + [user_info["编号"]])
+
+        # Commit the changes and close the connection
+        conn.commit()
+        conn.close()
+        # Show a success message
+        tkinter.messagebox.showinfo("信息", "修改成功")
+
+        # Reload the patient interface to show the updated data
+        patient_interface()
+
+    confirm_button = tk.Button(edit_frame, text="确定", command=confirm_edit, font=("宋体", 14))
+    confirm_button.grid(row=len(attributes)+1, column=0)  # Note the row index is now len(attributes)+1
+
+    # Add a button for cancelling the edit
+    cancel_button = tk.Button(edit_frame, text="取消", command=patient_interface, font=("宋体", 14))
+    cancel_button.grid(row=len(attributes)+1, column=1)  # Note the row index is now len(attributes)+1
+
+    # Pack the frame into the window
+    edit_frame.pack()
+def add_nurse():
+    # Create a new window
+    add_window = tk.Toplevel(window)
+
+    # Add labels and entries for the nurse's attributes
+    attributes = ["编号","姓名","性别","年龄", "主管医生", "联系方式", "账号", "密码"]
+    entries = {}
+    for attr in attributes:
+        label = tk.Label(add_window, text=attr)
+        label.pack()
+        entry = tk.Entry(add_window)
+        entry.pack()
+        entries[attr] = entry
+
+    # Add a button for confirming the addition
+    def confirm_addition():
+        # Connect to the database
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # Insert the new nurse into the nurse table
+        cursor.execute(f"INSERT INTO nurse ({', '.join(attributes)}) VALUES ({', '.join(['%s'] * len(attributes))})",
+                       [entry.get() for entry in entries.values()])
+
+        # Commit the changes and close the connection
+        conn.commit()
+        conn.close()
+
+        # Close the add window
+        add_window.destroy()
+
+        # Reload the nurse management interface to show the updated data
+        load_nurse_management_interface()
+
+    confirm_button = tk.Button(add_window, text="确定", command=confirm_addition,font=("宋体", 17))
+    confirm_button.pack()
+
+    # Add a button for cancelling the addition
+    cancel_button = tk.Button(add_window, text="取消", command=add_window.destroy,font=("宋体", 17))
+    cancel_button.pack()
+
+def delete_nurse():
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+
+    # 获取选中的行
+    selected_item = tree.selection()
+
+    # 如果没有选中任何行，就直接返回
+    if not selected_item:
+        return
+
+    # 获取选中行的护士编号
+    nurse_id = tree.item(selected_item[0])["values"][0]
+
+    # 弹出一个确认对话框，询问用户是否确定要删除
+    if not tkinter.messagebox.askyesno("确认", "确定要删除这个护士吗？"):
+        return
+
+    # 连接到数据库
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    # 从 nurse 表中删除该护士
+    cursor.execute("DELETE FROM nurse WHERE `编号` = %s", (nurse_id,))
+
+    # 提交更改并关闭连接
+    conn.commit()
+    conn.close()
+
+    # 重新加载护士管理界面以显示更新后的数据
+    load_nurse_management_interface()
+
+def edit_nurse():
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+
+    # 获取选中的行
+    selected_item = tree.selection()
+
+    # 如果没有选中任何行，就直接返回
+    if not selected_item:
+        return
+
+    # 获取选中行的护士编号
+    nurse_id = tree.item(selected_item[0])["values"][0]
+
+    # 连接到数据库
+    conn = connect_db()
+    cursor = conn.cursor()
+
+    # 从 nurse 表中获取该护士的信息
+    cursor.execute("SELECT * FROM nurse WHERE `编号` = %s", (nurse_id,))
+    nurse_info = cursor.fetchone()
+
+    # 关闭连接
+    conn.close()
+
+    # 创建一个新窗口
+    edit_window = tk.Toplevel(window)
+
+    # 在新窗口中添加输入框，用于编辑护士的信息
+    entries = {}
+    for i, attr in enumerate(["编号", "姓名", "性别", "主管医生", "联系方式", "年龄", "账号", "密码"]):
+        label = tk.Label(edit_window, text=attr)
+        label.grid(row=i, column=0)
+        entry = tk.Entry(edit_window)
+        entry.insert(0, nurse_info[i])  # 将当前值设置为输入框的初始值
+        entry.grid(row=i, column=1)
+        entries[attr] = entry
+
+    # 添加一个 "确认" 按钮，用于提交更改
+    def confirm_edit():
+        # 连接到数据库
+        conn = connect_db()
+        cursor = conn.cursor()
+
+        # 更新 nurse 表中的数据
+        cursor.execute("UPDATE nurse SET `姓名` = %s, `性别` = %s, `主管医生` = %s, `联系方式` = %s, `年龄` = %s, `账号` = %s, `密码` = %s WHERE `编号` = %s",
+                       (entries["姓名"].get(), entries["性别"].get(), entries["主管医生"].get(), entries["联系方式"].get(), entries["年龄"].get(), entries["账号"].get(), entries["密码"].get(), nurse_id))
+
+        # 提交更改并关闭连接
+        conn.commit()
+        conn.close()
+
+        # 关闭编辑窗口
+        edit_window.destroy()
+
+        # 重新加载护士管理界面以显示更新后的数据
+        load_nurse_management_interface()
+
+    confirm_button = tk.Button(edit_window, text="确认", command=confirm_edit,font=("宋体", 17))
+    confirm_button.grid(row=len(entries), column=0, columnspan=2)
+def load_nurse_management_interface():
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    # Add a button for returning to the admin interface
+    return_button = tk.Button(window, text="返回", command=admin_interface,font=("宋体", 17))
+    return_button.pack(side='top', anchor='w')
+
+    global tree  # 使用 global 关键字表示我们正在使用全局的 tree 变量
+
+    # Connect to the database and get the data from the nurse table
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT 编号,姓名,性别,年龄, 主管医生, 联系方式 FROM nurse")
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Create a Treeview widget
+    tree = ttk.Treeview(window)
+
+    # Define the column names
+    columns = ("编号", "姓名", "性别", "年龄", "主管医生","联系方式")
+    tree["columns"] = columns
+
+    # Define the heading for each column
+    for col in columns:
+        tree.heading(col, text=col)
+        tree.column(col, width=100)  # Set the width of each column to 100
+
+    # Show all columns
+    tree["show"] = "headings"
+
+    # Add the data to the Treeview widget
+    for row in rows:
+        tree.insert('', 'end', values=row)
+
+    # Pack the Treeview widget into the window
+    tree.pack()
+    # Add a button for adding a nurse
+    add_button = tk.Button(window, text="    增添    ", command=add_nurse,font=("宋体", 22))
+    add_button.pack(side='left', anchor='w')
+
+    # Add a button for deleting a nurse
+    delete_button = tk.Button(window, text="    删除    ", command=delete_nurse,font=("宋体", 22))
+    delete_button.pack(side='left', anchor='w')
+    # Add a button for editing a nurse
+    edit_button = tk.Button(window, text="    编辑    ", command=edit_nurse,font=("宋体", 22))
+    edit_button.pack(side='left', anchor='w')
+
+
+
+def admin_interface():
+    # Clear all widgets from the window
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    # Add a button for returning to the login interface
+    return_button = tk.Button(window, text="返回", command=lambda: load_login_interface('admin'),font=("宋体", 17))
+    return_button.pack(anchor='nw', side='top')
+    # 创建一个标签，用于显示时间
+    global time_label  # 使用 global 关键字表示我们正在使用全局的 time_label 变量
+    time_label = tk.Label(window,font=("宋体", 17))
+    time_label.pack()
+    # 开始更新时间
+    update_time()
+    # Display the welcome message
+    welcome_label = tk.Label(window, text=f"你好，{user_info['姓名']}管理员",font=("宋体", 17))
+    welcome_label.pack()
+    # Add buttons for managing doctors, departments, nurses, and patients
+    doctor_button = tk.Button(window, text="医生管理",command=load_doctor_management_interface,font=("宋体", 17))
+    doctor_button.pack()
+    department_button = tk.Button(window, text="科室管理",command=load_department_management_interface_admin,font=("宋体", 17))
+    department_button.pack()
+    nurse_button = tk.Button(window, text="护士管理",command=load_nurse_management_interface,font=("宋体", 17))
+    nurse_button.pack()
+    email_button = tk.Button(window, text="查看邮件", command=lambda: view_emails('administrator'),font=("宋体", 17))
+    email_button.pack()
+
+
+def patient_login(account,password, error_label):
+
+
+    # Connect to the database and query the patient table
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM patient WHERE `账号` = %s AND `密码` = %s", (account, password))
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Check if the entered account and password match any row in the patient table
+    if rows:
+        # Login successful, save the user info
+        user_info["编号"] = rows[0][0]
+        user_info["姓名"] = rows[0][1]
+        user_info["性别"] = rows[0][2]
+        tkinter.messagebox.showinfo("登录成功", "欢迎使用医院挂号医疗系统！")
+        patient_interface()
+    else:
+        # Login failed
+        tkinter.messagebox.showerror("登录失败", "账号或密码错误，请重新输入！")
+        error_label.config(text="账号或密码错误")
+
+def doctor_login(account, password, error_label):
+    # Connect to the database and query the doctor table
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM doctor WHERE `账号` = %s AND `密码` = %s", (account, password))
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Check if the entered account and password match any row in the doctor table
+    if rows:
+        user_info["编号"] = rows[0][0]
+        user_info["姓名"] = rows[0][1]
+        user_info["性别"] = rows[0][2]
+        tkinter.messagebox.showinfo("登录成功", "欢迎使用医院挂号医疗系统！")
+        doctor_interface()
+    else:
+        tkinter.messagebox.showerror("登录失败", "账号或密码错误，请重新输入！")
+        error_label.config(text="账号或密码错误")
+
+def nurse_login(account, password, error_label):
+
+    # Connect to the database and query the nurse table
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM nurse WHERE `账号` = %s AND `密码` = %s", (account, password))
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Check if the entered account and password match any row in the nurse table
+    if rows:
+        user_info["编号"] = rows[0][0]
+        user_info["姓名"] = rows[0][1]
+        user_info["性别"] = rows[0][2]
+        tkinter.messagebox.showinfo("登录成功", "欢迎使用医院挂号医疗系统！")
+        nurse_interface()
+    else:
+        tkinter.messagebox.showerror("登录失败", "账号或密码错误，请重新输入！")
+        error_label.config(text="账号或密码错误")
+
+def load_login_interface(user_type):
+    # Clear all widgets from the window
+
+    for widget in window.winfo_children():
+        widget.destroy()
+    bg_label = tk.Label(window, image=bg_photo)
+    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    # 创建一个标签，用于显示时间
+    global time_label  # 使用 global 关键字表示我们正在使用全局的 time_label 变量
+    time_label = tk.Label(window,font=("宋体", 17))
+    time_label.grid(row=1, column=1, columnspan=2)
+    # 开始更新时间
+    update_time()
+    # Add a label for the user type
+    user_type_label = tk.Label(window, text=f"{user_type}登录", font=("宋体", 17))
+    user_type_label.grid(row=3, column=1, columnspan=2)
+
+    # Add a label and entry for the account
+    account_label = tk.Label(window, text="账号", font=("宋体", 17))
+    account_label.grid(row=4, column=1)
+    account_entry = tk.Entry(window, font=("宋体", 17))
+    account_entry.grid(row=4, column=2)
+
+    # Add a label and entry for the password
+    password_label = tk.Label(window, text="密码", font=("宋体", 17))
+    password_label.grid(row=5, column=1)
+    password_entry = tk.Entry(window, show="*", font=("宋体", 17))  # The password is masked with *
+    password_entry.grid(row=5, column=2)
+
+    # Map user types to login functions
+    login_functions = {
+        'patient': patient_login,
+        'doctor': doctor_login,
+        'nurse': nurse_login,
+        'admin': admin_login
+    }
+
+    # Add a login button
+    login_button = tk.Button(window, text="登录", command=lambda : login_functions[user_type](account_entry.get(), password_entry.get(), error_label), font=("宋体", 17))
+    login_button.grid(row=6, column=1)
+
+    # Add a button for patient registration
+    register_button = tk.Button(window, text="注册", command=patient_register, font=("宋体", 17))
+    register_button.grid(row=6, column=2)
+
+    # Add login links
+    patient_link = tk.Label(window, text="病人登录", fg="blue", cursor="hand2", font=("宋体", 17))
+    patient_link.grid(row=7, column=1)
+    patient_link.bind("<Button-1>", lambda event: load_login_interface('patient'))
+
+    doctor_link = tk.Label(window, text="医生登录", fg="blue", cursor="hand2", font=("宋体", 17))
+    doctor_link.grid(row=7, column=2)
+    doctor_link.bind("<Button-1>", lambda event: load_login_interface('doctor'))
+
+    nurse_link = tk.Label(window, text="护士登录", fg="blue", cursor="hand2", font=("宋体", 17))
+    nurse_link.grid(row=8, column=1)
+    nurse_link.bind("<Button-1>", lambda event: load_login_interface('nurse'))
+
+    admin_link = tk.Label(window, text="管理员登录", fg="blue", cursor="hand2", font=("宋体", 17))
+    admin_link.grid(row=8, column=2)
+    admin_link.bind("<Button-1>", lambda event: load_login_interface('admin'))
+
+    # Add a button for exiting the program
+    exit_button = tk.Button(window, text="退出程序", command=window.destroy, font=("宋体", 17))
+    exit_button.grid(row=0, column=0)
+
+    # Add a label for error message
+    error_label = tk.Label(window, text="", font=("宋体", 17))
+    error_label.grid(row=9, column=1, columnspan=2)
+
+def admin_login(account,password, error_label):
+
+    # Connect to the database and query the admin table
+    conn = connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM administrator WHERE `账号` = %s AND `密码` = %s", (account, password))
+    rows = cursor.fetchall()
+    conn.close()
+    if rows:
+        user_info["编号"] = rows[0][0]
+        user_info["姓名"] = rows[0][1]
+        user_info["性别"] = rows[0][2]
+        tkinter.messagebox.showinfo("登录成功", "欢迎使用医院挂号医疗系统！")
+        admin_interface()
+    else:
+        tkinter.messagebox.showerror("登录失败", "账号或密码错误，请重新输入！")
+        error_label.config(text="账号或密码错误")
+
+
+
+
+
+# Create the main window
+window = tk.Tk()
+window.geometry('600x600')
+window.title("医院挂号医疗系统")
+bg_image = Image.open("hospital.jpg")
+bg_image = bg_image.resize((600, 600), Image.LANCZOS)
+
+# 在创建PhotoImage之前，确保已经创建了Tkinter窗口实例
+bg_photo = ImageTk.PhotoImage(bg_image)
+# 计算窗口的中心位置
+window_width = window.winfo_screenwidth()
+window_height = window.winfo_screenheight()
+x = (window_width - 800) // 2
+y = (window_height - 600) // 2
+window.geometry(f"600x600+{x}+{y}")
+
+
+# Load the patient login interface by default
+load_login_interface('patient')
+
+# Start the main loop
+window.mainloop()
